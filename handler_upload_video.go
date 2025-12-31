@@ -1,14 +1,17 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"io"
 	"mime"
 	"net/http"
 	"os"
+	"os/exec"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/bootdotdev/learn-file-storage-s3-golang-starter/internal/auth"
@@ -79,13 +82,23 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 
 	tempFile.Seek(0, io.SeekStart)
 
+	dar, _ := getVideoAspectRatio(tempFile.Name())
+
 	key := make([]byte, 32)
 	rand.Read(key)
-	vkey := base64.RawURLEncoding.EncodeToString(key)
+	s3key := base64.RawURLEncoding.EncodeToString(key)
+
+	if dar == "16:9" {
+		s3key = "landscape/" + s3key
+	} else if dar == "9:16" {
+		s3key = "portrait/" + s3key
+	} else {
+		s3key = "other/" + s3key
+	}
 
 	poi := s3.PutObjectInput{
 		Bucket:      &cfg.s3Bucket,
-		Key:         &vkey,
+		Key:         &s3key,
 		Body:        tempFile,
 		ContentType: &mediaType,
 	}
@@ -95,7 +108,48 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 		respondWithError(w, http.StatusBadRequest, "s3 upload error", err)
 	}
 
-	videoURL := "https://tubely-6661337.s3.eu-north-1.amazonaws.com/" + vkey
+	videoURL := "https://tubely-6661337.s3.eu-north-1.amazonaws.com/" + s3key
 	videoMetadata.VideoURL = &videoURL
 	cfg.db.UpdateVideo(videoMetadata)
+}
+
+type FFProbe struct {
+	Streams []Stream `json:"streams"`
+}
+
+type Stream struct {
+	Index              int    `json:"index"`
+	CodecType          string `json:"codec_type"`
+	DisplayAspectRatio string `json:"display_aspect_ratio"`
+}
+
+func getVideoAspectRatio(filePath string) (string, error) {
+	cmd := exec.Command("ffprobe", "-v", "error", "-print_format", "json", "-show_streams", filePath)
+	out := bytes.Buffer{}
+	cmd.Stdout = &out
+	err := cmd.Run()
+	if err != nil {
+		return "", err
+	}
+	var jsonRes map[string]any
+
+	json.Unmarshal(out.Bytes(), &jsonRes)
+
+	var probe FFProbe
+	if err := json.Unmarshal(out.Bytes(), &probe); err != nil {
+		return "", err
+	}
+	var dar string
+	for _, s := range probe.Streams {
+		if s.CodecType == "video" {
+			dar = s.DisplayAspectRatio
+			break
+		}
+	}
+
+	if dar == "16:9" || dar == "9:16" {
+		return dar, nil
+	} else {
+		return "other", nil
+	}
 }
